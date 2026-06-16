@@ -24,6 +24,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import * as Option from "effect/Option"
 import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
+import { LLMSessionLog } from "./llm/session-log"
 import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
 
@@ -111,6 +112,10 @@ const live: Layer.Layer<
         flags,
         isWorkflow,
       })
+      const sessionLog = LLMSessionLog.create(
+        { sessionID: input.sessionID, parentSessionID: input.parentSessionID, agent: input.agent, provider: item, model: input.model },
+        { messages: prepared.messages },
+      )
 
       // Wire up toolExecutor for DWS workflow models so that tool calls
       // from the workflow service are executed via opencode's tool system
@@ -245,6 +250,7 @@ const live: Layer.Layer<
           return {
             type: "native" as const,
             stream: native.stream,
+            sessionLog,
           }
         }
         yield* Effect.logInfo("llm runtime selected").pipe(
@@ -337,6 +343,7 @@ const live: Layer.Layer<
             },
           },
         }),
+        sessionLog,
       }
     })
 
@@ -351,7 +358,12 @@ const live: Layer.Layer<
 
             const result = yield* run({ ...input, abort: ctrl.signal })
 
-            if (result.type === "native") return result.stream
+            if (result.type === "native") {
+              return result.stream.pipe(
+                Stream.tap((event) => Effect.sync(() => result.sessionLog?.event(event))),
+                Stream.ensuring(Effect.sync(() => result.sessionLog?.flush())),
+              )
+            }
 
             // Adapter seam: both runtimes expose the same LLMEvent stream. Native
             // already returns one; AI SDK streams are converted here.
@@ -360,7 +372,13 @@ const live: Layer.Layer<
               e instanceof Error ? e : new Error(String(e)),
             ).pipe(
               Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event)),
+              Stream.tap((events) =>
+                Effect.sync(() => {
+                  for (const event of events) result.sessionLog?.event(event)
+                }),
+              ),
               Stream.flatMap((events) => Stream.fromIterable(events)),
+              Stream.ensuring(Effect.sync(() => result.sessionLog?.flush())),
             )
           }),
         ),
